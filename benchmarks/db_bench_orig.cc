@@ -7,11 +7,6 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-// EUNJI
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <list>
 
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
@@ -123,21 +118,11 @@ static bool FLAGS_use_existing_db = false;
 // If true, reuse existing log/MANIFEST files when re-opening a database.
 static bool FLAGS_reuse_logs = false;
 
+// If true, use compression.
+static bool FLAGS_compression = true;
+
 // Use the db with the following name.
 static const char* FLAGS_db = nullptr;
-
-// Use trace file for benchmark. 
-static const char* FLAGS_trace = nullptr;
-
-// EUNJI 
-static size_t TIDX_timestamp = 0;
-static size_t TIDX_key = 1;
-static size_t TIDX_key_size = 2;
-static size_t TIDX_val_size = 3;
-static size_t TIDX_cid = 4;
-static size_t TIDX_op = 5;
-static size_t TIDX_ttl = 6;
-static size_t TRC_PARAMS = 7;
 
 namespace leveldb {
 
@@ -330,21 +315,15 @@ class Stats {
     if (done_ < 1) done_ = 1;
 
     std::string extra;
-    // if (bytes_ > 0) {
-    //   // Rate is computed on actual elapsed time, not the sum of per-thread
-    //   // elapsed times.
-    //   double elapsed = (finish_ - start_) * 1e-6;
-    //   char rate[100];
-    //   std::snprintf(rate, sizeof(rate), "%6.1f MB/s",
-    //                 (bytes_ / 1048576.0) / elapsed);
-    //   extra = rate;
-    // } else { // EUNJI
+    if (bytes_ > 0) {
+      // Rate is computed on actual elapsed time, not the sum of per-thread
+      // elapsed times.
       double elapsed = (finish_ - start_) * 1e-6;
       char rate[100];
-      std::snprintf(rate, sizeof(rate), "%6.1f iops",
-                    FLAGS_num / elapsed);
+      std::snprintf(rate, sizeof(rate), "%6.1f MB/s",
+                    (bytes_ / 1048576.0) / elapsed);
       extra = rate;
-		// }
+    }
     AppendWithSpace(&extra, message_);
 
     std::fprintf(stdout, "%-12s : %11.3f micros/op;%s%s\n",
@@ -354,11 +333,6 @@ class Stats {
       std::fprintf(stdout, "Microseconds per op:\n%s\n",
                    hist_.ToString().c_str());
     }
-#ifdef HASH_FILTER
-		std::fprintf(stdout, "HASH_FILTER\n");
-#else
-		std::fprintf(stdout, "ORIG\n");
-#endif	
     std::fflush(stdout);
   }
 };
@@ -393,22 +367,6 @@ struct ThreadState {
   ThreadState(int index, int seed) : tid(index), rand(seed), shared(nullptr) {}
 };
 
-// EUNJI 
-struct TimedRequest {
-  std::string key;
-  double expired_time; 
-
-  TimedRequest(std::string key_, double time_) : key(key_), expired_time(time_) {}
-};
-
-
-bool operator <(const TimedRequest& ltr, const TimedRequest rtr)
-  {
-    return ltr.expired_time < rtr.expired_time;
-  }
-
-// namespace
-
 }  // namespace
 
 class Benchmark {
@@ -424,15 +382,6 @@ class Benchmark {
   int heap_counter_;
   CountComparator count_comparator_;
   int total_thread_count_;
-
-  // EUNJI
-  std::list<TimedRequest> timed_reqs; // guarded by mu_ttl
-  port::Mutex timed_mu;
-  port::CondVar timed_cv GUARDED_BY(timed_mu);
-  int timed_stop_;
-  std::string default_trace_path = "/Users/lee/papers-mac/tombstone_2021/cache-trace/samples/2020Mar";
-
-
 
   void PrintHeader() {
     const int kKeySize = 16 + FLAGS_key_prefix;
@@ -525,9 +474,7 @@ class Benchmark {
         reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
         heap_counter_(0),
         count_comparator_(BytewiseComparator()),
-        total_thread_count_(0),
-        timed_cv(&timed_mu),
-        timed_stop_(0) {
+        total_thread_count_(0) {
     std::vector<std::string> files;
     g_env->GetChildren(FLAGS_db, &files);
     for (size_t i = 0; i < files.size(); i++) {
@@ -573,20 +520,71 @@ class Benchmark {
       bool fresh_db = false;
       int num_threads = FLAGS_threads;
 
-      if (name == Slice("dotrace")) {
+      if (name == Slice("open")) {
+        method = &Benchmark::OpenBench;
+        num_ /= 10000;
+        if (num_ < 1) num_ = 1;
+      } else if (name == Slice("fillseq")) {
         fresh_db = true;
-        method = &Benchmark::DoTrace;
-      // }
-      // if (name == Slice("fillseq")) {
-      //   fresh_db = true;
-      //   method = &Benchmark::WriteSeq;
-      // } else if (name == Slice("fillbatch")) {
-      //   fresh_db = true;
-      //   entries_per_batch_ = 1000;
-      //   method = &Benchmark::WriteSeq;
-      // } else if (name == Slice("fillrandom")) {
-      //   fresh_db = true;
-      //   method = &Benchmark::WriteRandom;
+        method = &Benchmark::WriteSeq;
+      } else if (name == Slice("fillbatch")) {
+        fresh_db = true;
+        entries_per_batch_ = 1000;
+        method = &Benchmark::WriteSeq;
+      } else if (name == Slice("fillrandom")) {
+        fresh_db = true;
+        method = &Benchmark::WriteRandom;
+      } else if (name == Slice("overwrite")) {
+        fresh_db = false;
+        method = &Benchmark::WriteRandom;
+      } else if (name == Slice("fillsync")) {
+        fresh_db = true;
+        num_ /= 1000;
+        write_options_.sync = true;
+        method = &Benchmark::WriteRandom;
+      } else if (name == Slice("fill100K")) {
+        fresh_db = true;
+        num_ /= 1000;
+        value_size_ = 100 * 1000;
+        method = &Benchmark::WriteRandom;
+      } else if (name == Slice("readseq")) {
+        method = &Benchmark::ReadSequential;
+      } else if (name == Slice("readreverse")) {
+        method = &Benchmark::ReadReverse;
+      } else if (name == Slice("readrandom")) {
+        method = &Benchmark::ReadRandom;
+      } else if (name == Slice("readmissing")) {
+        method = &Benchmark::ReadMissing;
+      } else if (name == Slice("seekrandom")) {
+        method = &Benchmark::SeekRandom;
+      } else if (name == Slice("seekordered")) {
+        method = &Benchmark::SeekOrdered;
+      } else if (name == Slice("readhot")) {
+        method = &Benchmark::ReadHot;
+      } else if (name == Slice("readrandomsmall")) {
+        reads_ /= 1000;
+        method = &Benchmark::ReadRandom;
+      } else if (name == Slice("deleteseq")) {
+        method = &Benchmark::DeleteSeq;
+      } else if (name == Slice("deleterandom")) {
+        method = &Benchmark::DeleteRandom;
+      } else if (name == Slice("readwhilewriting")) {
+        num_threads++;  // Add extra thread for writing
+        method = &Benchmark::ReadWhileWriting;
+      } else if (name == Slice("compact")) {
+        method = &Benchmark::Compact;
+      } else if (name == Slice("crc32c")) {
+        method = &Benchmark::Crc32c;
+      } else if (name == Slice("snappycomp")) {
+        method = &Benchmark::SnappyCompress;
+      } else if (name == Slice("snappyuncomp")) {
+        method = &Benchmark::SnappyUncompress;
+      } else if (name == Slice("heapprofile")) {
+        HeapProfile();
+      } else if (name == Slice("stats")) {
+        PrintStats("leveldb.stats");
+      } else if (name == Slice("sstables")) {
+        PrintStats("leveldb.sstables");
       } else {
         if (!name.empty()) {  // No error message for empty name
           std::fprintf(stderr, "unknown benchmark '%s'\n",
@@ -649,15 +647,6 @@ class Benchmark {
     }
   }
 
-    static void BackgroundThreadBody(void* v) {
-    ThreadArg* arg = reinterpret_cast<ThreadArg*>(v);
-    ThreadState* thread = arg->thread;
-        
-    thread->stats.Start();
-    (arg->bm->*(arg->method))(thread);
-    thread->stats.Stop();
-
-  }
   void RunBenchmark(int n, Slice name,
                     void (Benchmark::*method)(ThreadState*)) {
     SharedState shared(n);
@@ -665,7 +654,7 @@ class Benchmark {
     ThreadArg* arg = new ThreadArg[n];
     for (int i = 0; i < n; i++) {
       arg[i].bm = this;
-      arg[i].method = method; // 여기에서 넘어온 함수로 실행. 
+      arg[i].method = method;
       arg[i].shared = &shared;
       ++total_thread_count_;
       // Seed the thread's random state deterministically based upon thread
@@ -675,15 +664,6 @@ class Benchmark {
       arg[i].thread->shared = &shared;
       g_env->StartThread(ThreadBody, &arg[i]);
     }
-
-    // EUNJI: create a ttl-expired object cleaning thread 
-    ThreadArg* timed_arg = new ThreadArg;
-    timed_arg->bm = this;
-    timed_arg->method = &Benchmark::DoDeleteExpiredObject;
-    // ++total_thread_count_;
-    timed_arg->thread = new ThreadState(total_thread_count_+1, 1000 + total_thread_count_+1);
-    timed_arg->thread->shared = nullptr;
-    g_env->StartThread(BackgroundThreadBody, timed_arg);
 
     shared.mu.Lock();
     while (shared.num_initialized < n) {
@@ -696,12 +676,6 @@ class Benchmark {
       shared.cv.Wait();
     }
     shared.mu.Unlock();
-
-    // EUNJI 
-    timed_mu.Lock();
-    timed_stop_ = 1;
-    timed_cv.SignalAll();
-    timed_mu.Unlock();   
 
     for (int i = 1; i < n; i++) {
       arg[0].thread->stats.Merge(arg[i].thread->stats);
@@ -719,6 +693,72 @@ class Benchmark {
     delete[] arg;
   }
 
+  void Crc32c(ThreadState* thread) {
+    // Checksum about 500MB of data total
+    const int size = 4096;
+    const char* label = "(4K per op)";
+    std::string data(size, 'x');
+    int64_t bytes = 0;
+    uint32_t crc = 0;
+    while (bytes < 500 * 1048576) {
+      crc = crc32c::Value(data.data(), size);
+      thread->stats.FinishedSingleOp();
+      bytes += size;
+    }
+    // Print so result is not dead
+    std::fprintf(stderr, "... crc=0x%x\r", static_cast<unsigned int>(crc));
+
+    thread->stats.AddBytes(bytes);
+    thread->stats.AddMessage(label);
+  }
+
+  void SnappyCompress(ThreadState* thread) {
+    RandomGenerator gen;
+    Slice input = gen.Generate(Options().block_size);
+    int64_t bytes = 0;
+    int64_t produced = 0;
+    bool ok = true;
+    std::string compressed;
+    while (ok && bytes < 1024 * 1048576) {  // Compress 1G
+      ok = port::Snappy_Compress(input.data(), input.size(), &compressed);
+      produced += compressed.size();
+      bytes += input.size();
+      thread->stats.FinishedSingleOp();
+    }
+
+    if (!ok) {
+      thread->stats.AddMessage("(snappy failure)");
+    } else {
+      char buf[100];
+      std::snprintf(buf, sizeof(buf), "(output: %.1f%%)",
+                    (produced * 100.0) / bytes);
+      thread->stats.AddMessage(buf);
+      thread->stats.AddBytes(bytes);
+    }
+  }
+
+  void SnappyUncompress(ThreadState* thread) {
+    RandomGenerator gen;
+    Slice input = gen.Generate(Options().block_size);
+    std::string compressed;
+    bool ok = port::Snappy_Compress(input.data(), input.size(), &compressed);
+    int64_t bytes = 0;
+    char* uncompressed = new char[input.size()];
+    while (ok && bytes < 1024 * 1048576) {  // Compress 1G
+      ok = port::Snappy_Uncompress(compressed.data(), compressed.size(),
+                                   uncompressed);
+      bytes += input.size();
+      thread->stats.FinishedSingleOp();
+    }
+    delete[] uncompressed;
+
+    if (!ok) {
+      thread->stats.AddMessage("(snappy failure)");
+    } else {
+      thread->stats.AddBytes(bytes);
+    }
+  }
+
   void Open() {
     assert(db_ == nullptr);
     Options options;
@@ -734,167 +774,21 @@ class Benchmark {
     options.max_open_files = FLAGS_open_files;
     options.filter_policy = filter_policy_;
     options.reuse_logs = FLAGS_reuse_logs;
+    options.compression =
+        FLAGS_compression ? kSnappyCompression : kNoCompression;
     Status s = DB::Open(options, FLAGS_db, &db_);
     if (!s.ok()) {
       std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
       std::exit(1);
     }
   }
-  void DoGet(ThreadState* thread, std::string* token){
 
-    ReadOptions options;
-    std::string value;
-    int found = 0;
-    // KeyBuffer key;
-    Slice key(token[TIDX_key]);
-    int64_t bytes = 0; 
-    
-    // key.Set(token[TIDX_key]);
-    if (db_->Get(options, key, &value).ok()) {
-        found++;
-        bytes += key.size() + value.size(); // EUNJI
-    } else {
-        bytes += key.size() + 100;
+  void OpenBench(ThreadState* thread) {
+    for (int i = 0; i < num_; i++) {
+      delete db_;
+      Open();
+      thread->stats.FinishedSingleOp();
     }
-    thread->stats.FinishedSingleOp();
-    
-    // char msg[100];
-    // std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
-    // thread->stats.AddMessage(msg);
-    thread->stats.AddBytes(bytes); // EUNJI
-  }
-  void DoSet(ThreadState* thread, std::string* token) {
-
-    Slice key(token[TIDX_key]);
-    size_t val_size = stoi(token[TIDX_val_size]);
-
-    RandomGenerator gen;
-    WriteBatch batch;
-    Status s;
-    int64_t bytes = 0;
-
-    batch.Clear();
-    for (int j = 0; j < entries_per_batch_; j++) {
-        batch.Put(key, gen.Generate(val_size));
-        bytes += val_size + key.size();
-        thread->stats.FinishedSingleOp();
-    }
-    s = db_->Write(write_options_, &batch);
-    if (!s.ok()) {
-      std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
-      std::exit(1);
-    }
-    thread->stats.AddBytes(bytes);
-
-    // ttl 
-    // std::cout << token[TIDX_ttl] << std::endl;
-    double ttl = stoi(token[TIDX_ttl]) * 1000000.0;
-    if (ttl > 0) {
-      double curr = g_env->NowMicros();
-      TimedRequest tq(key.ToString(), curr+ttl); 
-      timed_reqs.push_back(tq);
-    }
-  }
-  void DoDeleteExpiredObject(ThreadState* thread) {
-
-    RandomGenerator gen;
-    WriteBatch batch;
-    Status s;
-    // Slice key;
-    std::list<TimedRequest> timed_reqs_;
-    std::set<TimedRequest> expired_reqs;
-    
-    while(1) {
-      timed_mu.Lock();
-      
-      while(!timed_stop_ && timed_reqs.empty()) {
-        timed_cv.Wait();
-      }
-
-      if(timed_stop_) { // 죽기전에 list를 비우고 죽어야 함. 
-        timed_mu.Unlock();
-        break;
-      }
-      
-      timed_reqs.splice(timed_reqs.begin(), timed_reqs_);
-      timed_mu.Unlock();
-
-      for (auto it : timed_reqs_) {
-        // insert expired_reqs
-        TimedRequest r(it.key, it.expired_time);
-        expired_reqs.insert(r);
-        // std::cout << it.expired_time << std::endl;
-        // batch.Clear();
-        // batch.Delete(Slice(it.key));
-        // // thread->stats.FinishedSingleOp();
-        
-        // s = db_->Write(write_options_, &batch);
-        // if (!s.ok()) {
-        //   std::fprintf(stderr, "del error: %s\n", s.ToString().c_str());
-        //   std::exit(1);
-        // }
-      }
-
-      for (auto it : expired_reqs) {
-
-      }
-    }
-
-    // batch.Clear();
-    // for (int j = 0; j < entries_per_batch_; j++) {
-    //   batch.Delete(Slice("tmp"));
-    //     thread->stats.FinishedSingleOp();
-    // }
-    // s = db_->Write(write_options_, &batch);
-    // if (!s.ok()) {
-    //   std::fprintf(stderr, "del error: %s\n", s.ToString().c_str());
-    //   std::exit(1);
-    // }
-  }
-  
-  void DoTrace(ThreadState* thread) {
-
-    std::fprintf(stderr, "do trace\n");
-    // Read from trace file. 
-    std::string line;
-    default_trace_path = default_trace_path + "/" + std::string(FLAGS_trace);
-    std::cout << default_trace_path << std::endl;
-    std::ifstream trc_file (default_trace_path);
-    
-
-    size_t pos = 0;
-    std::string delimiter=",";
-    std::string token[TRC_PARAMS];
-
-    if (trc_file.is_open())
-    {   
-        while(std::getline(trc_file, line))
-        {
-            // std::cout << line << std::endl;
-            size_t pos = 0;
-            size_t i = 0;
-            while((pos = line.find(delimiter)) != std::string::npos){
-                token[i] = line.substr(0, pos);
-                // std::cout << token[i] << " ";
-                i++;
-                line.erase(0, pos + delimiter.length());
-            }
-            token[i] = line.substr(0, pos); // last item
-            // std::cout << token[i] << std::endl;
-
-            if (token[TIDX_op] == "get") {
-              // std::cout << "do read" << std:: endl;
-              DoGet(thread, token);
-            } else if (token[TIDX_op] == "set") {
-              // std::cout << "do write" << std:: endl;              
-              DoSet(thread, token);
-            }
-            // else {
-            //   std::cout << token[TIDX_op] << std::endl;
-            // }
-        }
-    }
-    return;
   }
 
   void WriteSeq(ThreadState* thread) { DoWrite(thread, true); }
@@ -931,7 +825,6 @@ class Benchmark {
     thread->stats.AddBytes(bytes);
   }
 
-  // 이건 거의 range query 처럼 동작. 
   void ReadSequential(ThreadState* thread) {
     Iterator* iter = db_->NewIterator(ReadOptions());
     int i = 0;
@@ -945,26 +838,35 @@ class Benchmark {
     thread->stats.AddBytes(bytes);
   }
 
-  // 트레이스에서 읽어서 보내려면 이 함수 변형해서 써야할지도. 
+  void ReadReverse(ThreadState* thread) {
+    Iterator* iter = db_->NewIterator(ReadOptions());
+    int i = 0;
+    int64_t bytes = 0;
+    for (iter->SeekToLast(); i < reads_ && iter->Valid(); iter->Prev()) {
+      bytes += iter->key().size() + iter->value().size();
+      thread->stats.FinishedSingleOp();
+      ++i;
+    }
+    delete iter;
+    thread->stats.AddBytes(bytes);
+  }
+
   void ReadRandom(ThreadState* thread) {
     ReadOptions options;
     std::string value;
     int found = 0;
     KeyBuffer key;
-    int64_t bytes = 0; // EUNJI
     for (int i = 0; i < reads_; i++) {
       const int k = thread->rand.Uniform(FLAGS_num);
       key.Set(k);
       if (db_->Get(options, key.slice(), &value).ok()) {
         found++;
-        bytes += key.slice().size() + value.size(); // EUNJI
       }
       thread->stats.FinishedSingleOp();
     }
     char msg[100];
     std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
     thread->stats.AddMessage(msg);
-    thread->stats.AddBytes(bytes); // EUNJI
   }
 
   void ReadMissing(ThreadState* thread) {
@@ -1121,7 +1023,6 @@ class Benchmark {
 
 }  // namespace leveldb
 
-
 int main(int argc, char** argv) {
   FLAGS_write_buffer_size = leveldb::Options().write_buffer_size;
   FLAGS_max_file_size = leveldb::Options().max_file_size;
@@ -1149,6 +1050,9 @@ int main(int argc, char** argv) {
     } else if (sscanf(argv[i], "--reuse_logs=%d%c", &n, &junk) == 1 &&
                (n == 0 || n == 1)) {
       FLAGS_reuse_logs = n;
+    } else if (sscanf(argv[i], "--compression=%d%c", &n, &junk) == 1 &&
+               (n == 0 || n == 1)) {
+      FLAGS_compression = n;
     } else if (sscanf(argv[i], "--num=%d%c", &n, &junk) == 1) {
       FLAGS_num = n;
     } else if (sscanf(argv[i], "--reads=%d%c", &n, &junk) == 1) {
@@ -1173,8 +1077,6 @@ int main(int argc, char** argv) {
       FLAGS_open_files = n;
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
-    } else if (strncmp(argv[i], "--trace=", 8) == 0) {
-      FLAGS_trace = argv[i] + 8;
     } else {
       std::fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
       std::exit(1);
