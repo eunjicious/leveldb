@@ -12,6 +12,8 @@
 #include <fstream>
 #include <string>
 #include <list>
+#include <chrono>
+#include <typeinfo>
 
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
@@ -129,6 +131,9 @@ static const char* FLAGS_db = nullptr;
 // Use trace file for benchmark. 
 static const char* FLAGS_trace = nullptr;
 
+// static std::atomic<int> timed_req_arrival{0};
+// static int timed_req_arrival;
+
 // EUNJI 
 static size_t TIDX_timestamp = 0;
 static size_t TIDX_key = 1;
@@ -138,6 +143,8 @@ static size_t TIDX_cid = 4;
 static size_t TIDX_op = 5;
 static size_t TIDX_ttl = 6;
 static size_t TRC_PARAMS = 7;
+
+typedef std::chrono::time_point<std::chrono::system_clock> chrono_time_t;
 
 namespace leveldb {
 
@@ -294,10 +301,10 @@ class Stats {
       double now = g_env->NowMicros();
       double micros = now - last_op_finish_;
       hist_.Add(micros);
-      if (micros > 20000) {
-        std::fprintf(stderr, "long op: %.1f micros%30s\r", micros, "");
-        std::fflush(stderr);
-      }
+      // if (micros > 20000) {
+      //   std::fprintf(stderr, "long op: %.1f micros%30s\r", micros, "");
+      //   std::fflush(stderr);
+      // }
       last_op_finish_ = now;
     }
 
@@ -396,16 +403,16 @@ struct ThreadState {
 // EUNJI 
 struct TimedRequest {
   std::string key;
-  double expired_time; 
+  chrono_time_t expired_time;
 
-  TimedRequest(std::string key_, double time_) : key(key_), expired_time(time_) {}
+  TimedRequest(std::string key_, chrono_time_t time_) : key(key_), expired_time(time_) {}
 };
 
 
 bool operator <(const TimedRequest& ltr, const TimedRequest rtr)
-  {
-    return ltr.expired_time < rtr.expired_time;
-  }
+{
+  return ltr.expired_time < rtr.expired_time;
+}
 
 // namespace
 
@@ -429,10 +436,12 @@ class Benchmark {
   std::list<TimedRequest> timed_reqs; // guarded by mu_ttl
   port::Mutex timed_mu;
   port::CondVar timed_cv GUARDED_BY(timed_mu);
+
+  // std::list<TimedRequest> timed_reqs; // guarded by mu_ttl
+  // std::mutex timed_mu;
+  // std::condition_variable timed_cv; // GUARDED_BY(timed_mu);
   int timed_stop_;
   std::string default_trace_path = "/Users/lee/papers-mac/tombstone_2021/cache-trace/samples/2020Mar";
-
-
 
   void PrintHeader() {
     const int kKeySize = 16 + FLAGS_key_prefix;
@@ -573,8 +582,11 @@ class Benchmark {
       bool fresh_db = false;
       int num_threads = FLAGS_threads;
 
-      if (name == Slice("dotrace")) {
+      if (name == Slice("inittrace")) {
         fresh_db = true;
+        method = &Benchmark::InitTrace;
+      } else if (name == Slice("dotrace")) {
+        fresh_db = false;
         method = &Benchmark::DoTrace;
       // }
       // if (name == Slice("fillseq")) {
@@ -763,10 +775,11 @@ class Benchmark {
     // thread->stats.AddMessage(msg);
     thread->stats.AddBytes(bytes); // EUNJI
   }
-  void DoSet(ThreadState* thread, std::string* token) {
+  void DoSet(ThreadState* thread, std::string* token, bool use_ttl=false) {
 
     Slice key(token[TIDX_key]);
     size_t val_size = stoi(token[TIDX_val_size]);
+    if (val_size == 0) val_size = 100;
 
     RandomGenerator gen;
     WriteBatch batch;
@@ -788,11 +801,20 @@ class Benchmark {
 
     // ttl 
     // std::cout << token[TIDX_ttl] << std::endl;
-    double ttl = stoi(token[TIDX_ttl]) * 1000000.0;
-    if (ttl > 0) {
-      double curr = g_env->NowMicros();
-      TimedRequest tq(key.ToString(), curr+ttl); 
-      timed_reqs.push_back(tq);
+    if (use_ttl) {
+      int ttl = stoi(token[TIDX_ttl]);
+      if (ttl > 0) {
+        chrono_time_t expired_time = std::chrono::system_clock::now() + std::chrono::seconds(ttl);
+        TimedRequest tq(key.ToString(), expired_time); 
+
+        timed_mu.Lock();
+        timed_reqs.push_back(tq);
+        // std::cout << "push: " << timed_reqs.size() << std::endl;
+        // timed_req_arrival = 1;
+        if (timed_reqs.size() > 100)
+          timed_cv.Signal();
+        timed_mu.Unlock();
+      }
     }
   }
   void DoDeleteExpiredObject(ThreadState* thread) {
@@ -804,41 +826,109 @@ class Benchmark {
     std::list<TimedRequest> timed_reqs_;
     std::set<TimedRequest> expired_reqs;
     
-    while(1) {
+    while (1) {
+
+      // std::unique_lock<std::mutex> lk(timed_mu);
+      auto now = std::chrono::system_clock::now();
+
+      // if(timed_cv.wait_until(lk, now + std::chrono::seconds(1), [](){return timed_req_arrival == 1;})) {
+      //   std::cout << "Timed requests arrived. " << timed_reqs.size() << std::endl;
+      // }
+
+
       timed_mu.Lock();
-      
-      while(!timed_stop_ && timed_reqs.empty()) {
+      // while(timed_req_arrival == 0) {
+      while(timed_reqs.empty()) {
+        // std::cout << "Sleep .." << std::endl;
         timed_cv.Wait();
       }
 
+      // std::cout<< "Wake up" << std::endl;
+      
       if(timed_stop_) { // 죽기전에 list를 비우고 죽어야 함. 
         timed_mu.Unlock();
         break;
       }
-      
-      timed_reqs.splice(timed_reqs.begin(), timed_reqs_);
+      // std::cout << "reqs list = " << timed_reqs.size() << std::endl;
+
+      timed_reqs_.splice(timed_reqs_.end(), timed_reqs);
+      // timed_req_arrival == 0;
       timed_mu.Unlock();
+      
+      // std::cout << "spliced list = " << timed_reqs_.size() << std::endl;
+      // for (auto it : timed_reqs_) {
+      // for (std::list<TimedRequest>::iterator it = timed_reqs_.begin(); it != timed_reqs_.end(); it++) {
+      // for (auto it = timed_reqs_.begin(); it != timed_reqs_.end(); it++) {
+      auto it = timed_reqs_.begin();
 
-      for (auto it : timed_reqs_) {
+      while (it != timed_reqs_.end()) {
         // insert expired_reqs
-        TimedRequest r(it.key, it.expired_time);
+        TimedRequest r((*it).key, (*it).expired_time);
+        // TimedRequest r(it.key, it.expired_time);
         expired_reqs.insert(r);
-        // std::cout << it.expired_time << std::endl;
-        // batch.Clear();
-        // batch.Delete(Slice(it.key));
-        // // thread->stats.FinishedSingleOp();
-        
-        // s = db_->Write(write_options_, &batch);
-        // if (!s.ok()) {
-        //   std::fprintf(stderr, "del error: %s\n", s.ToString().c_str());
-        //   std::exit(1);
-        // }
+        it = timed_reqs_.erase(it);
       }
 
-      for (auto it : expired_reqs) {
+      {
+        int num_delete = 0;
+        std::chrono::duration<double>sec; 
 
+        for (auto it : expired_reqs) {
+          chrono_time_t ctime = std::chrono::system_clock::now();
+          sec = it.expired_time - ctime;
+          if (it.expired_time < ctime) {
+          // if (it.expired_time > ctime) {
+            batch.Clear();
+            batch.Delete(Slice(it.key));
+            // std::cout << "Delete: " << it.key << std::endl;
+            // thread->stats.FinishedSingleOp();
+            s = db_->Write(write_options_, &batch);
+            if (!s.ok()) {
+              std::fprintf(stderr, "del error: %s\n", s.ToString().c_str());
+              std::exit(1);
+            }
+            num_delete++;
+          } else {
+            // std::cout << "need to wait for " << sec.count() << "s" << std::endl;
+            break;
+          }
+        }
+        // std::cout << "Deleted: " << num_delete << std::endl;
       }
+
+
     }
+
+      // // }
+
+
+      
+      // timed_reqs.splice(timed_reqs.begin(), timed_reqs_);
+      // timed_mu.unlock();
+
+      // for (auto it : timed_reqs_) {
+      //   // insert expired_reqs
+      //   TimedRequest r(it.key, it.expired_time);
+      //   expired_reqs.insert(r);
+      //   // std::cout << it.expired_time << std::endl;
+      //   // batch.Clear();
+      //   // batch.Delete(Slice(it.key));
+      //   // // thread->stats.FinishedSingleOp();
+        
+      //   // s = db_->Write(write_options_, &batch);
+      //   // if (!s.ok()) {
+      //   //   std::fprintf(stderr, "del error: %s\n", s.ToString().c_str());
+      //   //   std::exit(1);
+      //   // }
+      // }
+
+      // for (auto it : expired_reqs) {
+        
+
+      // }
+
+      // expired_reqs.begin()
+
 
     // batch.Clear();
     // for (int j = 0; j < entries_per_batch_; j++) {
@@ -887,7 +977,7 @@ class Benchmark {
               DoGet(thread, token);
             } else if (token[TIDX_op] == "set") {
               // std::cout << "do write" << std:: endl;              
-              DoSet(thread, token);
+              DoSet(thread, token, true);
             }
             // else {
             //   std::cout << token[TIDX_op] << std::endl;
@@ -896,6 +986,52 @@ class Benchmark {
     }
     return;
   }
+  
+  void InitTrace(ThreadState* thread) {
+
+    std::fprintf(stderr, "init trace\n");
+    // Read from trace file. 
+    std::string line;
+    default_trace_path = default_trace_path + "/" + std::string(FLAGS_trace);
+    std::cout << default_trace_path << std::endl;
+    std::ifstream trc_file (default_trace_path);
+    
+
+    size_t pos = 0;
+    std::string delimiter=",";
+    std::string token[TRC_PARAMS];
+
+    if (trc_file.is_open())
+    {   
+        while(std::getline(trc_file, line))
+        {
+            // std::cout << line << std::endl;
+            size_t pos = 0;
+            size_t i = 0;
+            while((pos = line.find(delimiter)) != std::string::npos){
+                token[i] = line.substr(0, pos);
+                // std::cout << token[i] << " ";
+                i++;
+                line.erase(0, pos + delimiter.length());
+            }
+            token[i] = line.substr(0, pos); // last item
+            // std::cout << token[i] << std::endl;
+
+            if (token[TIDX_op] == "get") {
+              // std::cout << "do read" << std:: endl;
+              DoSet(thread, token, false);
+            } else if (token[TIDX_op] == "set") {
+              // std::cout << "do write" << std:: endl;              
+              DoSet(thread, token, true);
+            }
+            // else {
+            //   std::cout << token[TIDX_op] << std::endl;
+            // }
+        }
+    }
+    return;
+  }
+
 
   void WriteSeq(ThreadState* thread) { DoWrite(thread, true); }
 
